@@ -14,9 +14,13 @@ import {
 import { ChatResult, ChatGenerationChunk } from "@langchain/core/outputs";
 import { getEnvironmentVariable } from "@langchain/core/utils/env";
 import { convertToOpenAITool } from "@langchain/core/utils/function_calling";
-import { Runnable } from "@langchain/core/runnables";
-import { BaseLanguageModelInput } from "@langchain/core/language_models/base";
 import { CallbackManagerForLLMRun } from "@langchain/core/callbacks/manager";
+
+// import { Runnable } from "@langchain/core/runnables";
+// import { BaseLanguageModelInput } from "@langchain/core/language_models/base";
+// import zodToJsonSchema from "zod-to-json-schema";
+// import { JsonOutputParser } from "@langchain/core/output_parsers";
+// import { z } from "zod";
 
 interface EdenAIToolCall {
   name: string;
@@ -24,19 +28,25 @@ interface EdenAIToolCall {
   id: string;
 }
 
+interface EdenAIMediaContent {
+  type: "text" | "media_url" | "media_base64";
+  content: {
+    text?: string;
+    media_url?: string;
+    media_type?: string;
+    media_base64?: string;
+  };
+}
+
 interface EdenAIChatRequest {
   providers: string;
-  text: string;
-  previous_history?: Array<{
+  messages: Array<{
     role: "user" | "assistant";
-    message: string;
+    content: EdenAIMediaContent[];
     tool_calls?: EdenAIToolCall[];
   }>;
   chatbot_global_action?: string;
-  tool_results?: Array<{
-    id: string;
-    result: string;
-  }>;
+  tool_results?: Array<{ id: string; result: string }>;
   temperature?: number;
   max_tokens?: number;
   fallback_providers?: string;
@@ -47,6 +57,38 @@ interface EdenAIChatRequest {
     parameters: Record<string, unknown>;
   }>;
   show_original_response?: boolean;
+  response_format?: {
+    type: "json_schema";
+    json_schema?: Record<string, unknown>;
+    strict?: boolean;
+  };
+}
+
+interface EdenAIChatStreamRequest {
+  providers: string;
+  text: string
+  chatbot_global_action?: string;
+  tool_results?: Array<{ id: string; result: string }>;
+  temperature?: number;
+  max_tokens?: number;
+  fallback_providers?: string;
+  settings?: Record<string, string>;
+  available_tools?: Array<{
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  }>;
+  show_original_response?: boolean;
+  response_format?: {
+    type: "json_schema";
+    json_schema?: Record<string, unknown>;
+    strict?: boolean;
+  };
+  previous_history?: Array<{
+    role: "user" | "assistant";
+    message: string;
+    tool_calls?: EdenAIToolCall[];
+  }>;
 }
 
 interface EdenAIToolCall {
@@ -76,6 +118,17 @@ interface EdenAIChatResponse {
     };
   };
 }
+interface MultimodalEdenAIChatResponse {
+  [provider: string]: {
+    original_response: any;
+    generated_text: string | null;
+    status: "success" | "fail";
+    messages: Array<EdenAIToolMessage>;
+    error?: {
+      message: string;
+    };
+  };
+}
 
 export interface ChatEdenAICallOptions extends BaseChatModelCallOptions {
   fallback_providers?: string;
@@ -87,6 +140,11 @@ export interface ChatEdenAICallOptions extends BaseChatModelCallOptions {
       parameters: Record<string, unknown>;
     };
   }>;
+  response_format?: {
+    type: "json_schema";
+    json_schema?: Record<string, unknown>;
+    strict?: boolean;
+  };
 }
 
 export interface ChatEdenAIParams extends BaseChatModelParams {
@@ -98,10 +156,92 @@ export interface ChatEdenAIParams extends BaseChatModelParams {
 }
 
 function convertMessagesToEdenAIFormat(messages: BaseMessage[]): {
-  text: string;
-  previous_history: EdenAIChatRequest["previous_history"];
+  messages: EdenAIChatRequest["messages"];
   chatbot_global_action?: string;
   tool_results?: EdenAIChatRequest["tool_results"];
+} {
+  const toolResults: Array<{ id: string; result: string }> = [];
+  const convertedMessages: EdenAIChatRequest["messages"] = [];
+  let systemMessage: string | undefined;
+
+  for (const message of messages) {
+    // eslint-disable-next-line no-instanceof/no-instanceof
+    if (message instanceof ToolMessage) {
+      toolResults.push({
+        id: message.tool_call_id,
+        result: Array.isArray(message.content) 
+          ? message.content.join(", ") 
+          : message.content,
+      });
+    // eslint-disable-next-line no-instanceof/no-instanceof
+    } else if (message instanceof SystemMessage) {
+      systemMessage = Array.isArray(message.content)
+        ? message.content.join(", ")
+        : message.content;
+    } else {
+      const role = message._getType() === "human" ? "user" : "assistant";
+      const content: EdenAIMediaContent[] = [];
+
+      if (typeof message.content === "string") {
+        content.push({
+          type: "text",
+          content: { text: message.content }
+        });
+      } else if (Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (part.type === "text") {
+            content.push({
+              type: "text",
+              content: { text: part.text }
+            });
+             } else if (part.type === "media_url") {
+            const url = part.image_url;
+            content.push({
+              type: "media_url",
+              content: {
+                media_url: url,
+                media_type: "image/jpeg"
+              }
+             })
+          } else if (part.type === "media_base64") {
+            content.push({
+              type: "media_base64",
+              content: {
+                media_base64: part.media_base64,
+                media_type: part.media_type
+              }
+            });
+          }
+        }
+      }
+
+      convertedMessages.push({
+        role,
+        content,
+        tool_calls: "tool_calls" in message && Array.isArray(message.tool_calls) ? message.tool_calls.map(tc => ({
+          id: tc.id,
+          name: tc.name,
+          arguments: JSON.stringify(tc.args)
+        })) : undefined
+      });
+    }
+  }
+
+
+  return {
+    messages: convertedMessages,
+    chatbot_global_action: systemMessage,
+    tool_results: toolResults.length > 0 ? toolResults : undefined
+  };
+}
+
+
+
+function convertMessagesToEdenAIStreamFormat(messages: BaseMessage[]): {
+  text: string;
+  previous_history: EdenAIChatStreamRequest["previous_history"];
+  chatbot_global_action?: string;
+  tool_results?: EdenAIChatStreamRequest["tool_results"];
 } {
   const toolResults: Array<{ id: string; result: string }> = [];
   const filteredMessages: BaseMessage[] = [];
@@ -122,7 +262,7 @@ function convertMessagesToEdenAIFormat(messages: BaseMessage[]): {
     }
   }
 
-  const previousHistory: EdenAIChatRequest["previous_history"] = [];
+  const previousHistory: EdenAIChatStreamRequest["previous_history"] = [];
   let lastHumanMessage = "";
 
   for (const message of filteredMessages) {
@@ -163,7 +303,7 @@ export class ChatEdenAI extends BaseChatModel<ChatEdenAICallOptions> {
 
   edenaiApiKey: string;
 
-  apiUrl = "https://api.edenai.run/v2/text/chat";
+  apiUrl = "https://api.edenai.run/v2/multimodal/chat";
 
   constructor(params: ChatEdenAIParams = {}) {
     super(params);
@@ -189,7 +329,7 @@ export class ChatEdenAI extends BaseChatModel<ChatEdenAICallOptions> {
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
     const formattedMessages = convertMessagesToEdenAIFormat(messages);
-
+    
     const requestBody: EdenAIChatRequest = {
       providers: this.provider,
       ...formattedMessages,
@@ -197,40 +337,38 @@ export class ChatEdenAI extends BaseChatModel<ChatEdenAICallOptions> {
       max_tokens: this.maxTokens,
       fallback_providers: options.fallback_providers,
       settings: this.model ? { [this.provider]: this.model } : undefined,
-      available_tools: options.tools?.map((tool) => {
-        const convertedTool = convertToOpenAITool(tool);
-        return {
-          name: convertedTool.function.name,
-          description: convertedTool.function.description || "",
-          parameters: convertedTool.function.parameters,
-        };
-      }),
+      available_tools: options.tools?.map(tool => ({
+        name: tool.function.name,
+        description: tool.function.description || "",
+        parameters: tool.function.parameters
+      })),
       show_original_response: true,
+      response_format: options.response_format
     };
 
     const response = await this.makeRequest(requestBody, false);
-    const providerResponse = (response as EdenAIChatResponse)[this.provider];
+    const providerResponse = (response as MultimodalEdenAIChatResponse)[this.provider];
     if (providerResponse.status === "fail") {
       throw new Error(providerResponse.error?.message || "EdenAI API error");
     }
 
-    const assistantMessages = providerResponse.message.filter(
-      (msg) => msg.role === "assistant"
-    );
+    const assistantMessage = providerResponse.messages
+    .filter((msg) => msg.role === "assistant")
+    .at(-1); 
 
-    const toolCalls = assistantMessages
-      .filter((msg) => msg.tool_calls)
-      .flatMap((msg) => msg.tool_calls);
+    if (!assistantMessage) {
+      throw new Error("No assistant message found in response");
+    }
+
+    const toolCalls = assistantMessage.tool_calls || [];
 
     const message = new AIMessage({
       content: providerResponse.generated_text ?? "",
-      tool_calls: toolCalls
-        .filter((call): call is EdenAIToolCall => call !== null)
-        .map((call) => ({
-          name: call.name,
-          args: JSON.parse(call.arguments),
-          id: call.id,
-        })),
+      tool_calls: toolCalls.map((call) => ({
+        name: call.name,
+        args: JSON.parse(call.arguments),
+        id: call.id,
+      })),
     });
 
     const tokenUsage = providerResponse.original_response?.usage;
@@ -260,9 +398,9 @@ export class ChatEdenAI extends BaseChatModel<ChatEdenAICallOptions> {
     options: this["ParsedCallOptions"],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const formattedMessages = convertMessagesToEdenAIFormat(messages);
+    const formattedMessages = convertMessagesToEdenAIStreamFormat(messages);
 
-    const requestBody: EdenAIChatRequest = {
+    const requestBody: EdenAIChatStreamRequest = {
       providers: this.provider,
       ...formattedMessages,
       temperature: this.temperature,
@@ -326,24 +464,8 @@ export class ChatEdenAI extends BaseChatModel<ChatEdenAICallOptions> {
     }
   }
 
-  override bindTools(
-    tools: Array<{
-      type: "function";
-      function: {
-        name: string;
-        description: string;
-        parameters: Record<string, unknown>;
-      };
-    }>,
-    kwargs?: Partial<ChatEdenAICallOptions>
-  ): Runnable<BaseLanguageModelInput, AIMessageChunk, ChatEdenAICallOptions> {
-    return this.bind({
-      tools: tools.map((tool) => convertToOpenAITool(tool)),
-      ...kwargs,
-    } as ChatEdenAICallOptions);
-  }
 
-  private async makeRequest(body: EdenAIChatRequest, stream: boolean) {
+  private async makeRequest(body: EdenAIChatRequest | EdenAIChatStreamRequest, stream: boolean) {
     const headers = {
       Authorization: `Bearer ${this.edenaiApiKey}`,
       "Content-Type": "application/json",
@@ -352,11 +474,10 @@ export class ChatEdenAI extends BaseChatModel<ChatEdenAICallOptions> {
     const apiUrl = stream
       ? "https://api.edenai.run/v2/text/chat/stream"
       : this.apiUrl;
-
     const response = await fetch(apiUrl, {
       method: "POST",
       headers,
-      body: JSON.stringify({ ...body, stream, show_original_response: true }),
+      body: JSON.stringify({ ...body, show_original_response: true }),
     });
 
     if (!response.ok) {
@@ -366,6 +487,43 @@ export class ChatEdenAI extends BaseChatModel<ChatEdenAICallOptions> {
       );
     }
 
-    return stream ? response : ((await response.json()) as EdenAIChatResponse);
+    return stream ? response : ((await response.json()) as MultimodalEdenAIChatResponse);
   }
+
+  // override bindTools(
+  //   tools: Array<{
+  //     type: "function";
+  //     function: {
+  //       name: string;
+  //       description: string;
+  //       parameters: Record<string, unknown>;
+  //     };
+  //   }>,
+  //   kwargs?: Partial<ChatEdenAICallOptions>
+  // ): Runnable<BaseLanguageModelInput, AIMessageChunk, ChatEdenAICallOptions> {
+  //   return this.bind({
+  //     tools: tools.map((tool) => convertToOpenAITool(tool)),
+  //     ...kwargs,
+  //   } as ChatEdenAICallOptions);
+  // }
+
+
+  // withStructuredOutput<RunOutput extends Record<string, any> = Record<string, any>>(
+  //   schema: z.ZodType<RunOutput> | Record<string, any>,
+  //   config?: { name?: string; strict?: boolean }
+  // ): Runnable<BaseLanguageModelInput, RunOutput> {
+  //   // eslint-disable-next-line no-instanceof/no-instanceof
+  //   const jsonSchema = schema instanceof z.ZodType 
+  //     ? zodToJsonSchema(schema)
+  //     : schema;
+
+  //   return this.bind({
+  //     response_format: {
+  //       type: "json_schema",
+  //       json_schema: jsonSchema,
+  //       strict: config?.strict
+  //     }
+  //   }).pipe(new JsonOutputParser());
+  // }
 }
+
